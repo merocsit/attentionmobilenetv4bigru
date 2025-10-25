@@ -1977,3 +1977,386 @@ for folder in sorted(os.listdir(base_dir)):
 
         print(f"✅ Processed {seg_file} → {noisy_filename} & {png_filename} (CWT shape: {cwt_matrix.shape})")
 
+
+
+# ==============================
+# 1️⃣ Imports
+# ==============================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import os
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import glob
+from scipy.signal import resample
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ==============================
+# 2️⃣ Hyperparameters
+# ==============================
+latent_dim = 100
+signal_length = 500  # fixed length for GAN input
+batch_size = 128
+epochs = 25
+lr = 0.0002
+beta1 = 0.5
+output_dir = './ECG_ID_GAN_NPY_output'
+os.makedirs(output_dir, exist_ok=True)
+
+# ==============================
+# 3️⃣ Generator & Discriminator (1D)
+# ==============================
+class Generator1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.ConvTranspose1d(latent_dim, 256, 16, stride=1, padding=0, bias=False),
+            nn.BatchNorm1d(256), nn.ReLU(True),
+            nn.ConvTranspose1d(256, 128, 16, stride=2, padding=7, output_padding=1, bias=False),
+            nn.BatchNorm1d(128), nn.ReLU(True),
+            nn.ConvTranspose1d(128, 64, 16, stride=2, padding=7, output_padding=1, bias=False),
+            nn.BatchNorm1d(64), nn.ReLU(True),
+            nn.ConvTranspose1d(64, 1, 16, stride=2, padding=7, output_padding=1, bias=False),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        return self.model(z)
+
+class Discriminator1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.feature = nn.Sequential(
+            nn.Conv1d(1, 64, 16, stride=2, padding=7, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(64, 128, 16, stride=2, padding=7, bias=False),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(128, 256, 16, stride=2, padding=7, bias=False),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),  # output (batch_size, 256, 1)
+            nn.Flatten(),              # output (batch_size, 256)
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.feature(x)
+        x = self.classifier(x)
+        return x.view(-1)  # output shape: (batch_size,)
+
+# ==============================
+# 4️⃣ Dataset Loading & Resampling
+# ==============================
+data_dir = "/kaggle/input/ecgidonlynpypng/ecg-id-database-1.0.0_NOISY_separated/npy_files"
+all_files = glob.glob(f"{data_dir}/**/*.npy", recursive=True)
+
+def resample_signal(signal, target_length=signal_length):
+    return resample(signal, target_length)
+
+ecg_list = []
+for f in all_files:
+    arr = np.load(f)
+    if len(arr.shape) == 1:
+        arr = arr.reshape(1, -1)
+    # Resample all samples to fixed length
+    resampled = np.array([resample_signal(sig, target_length=signal_length) for sig in arr])
+    ecg_list.append(resampled)
+
+ecg_data = np.concatenate(ecg_list, axis=0)
+print(f"Loaded {ecg_data.shape[0]} ECG samples of fixed length {signal_length}.")
+
+# Normalize to [-1,1]
+ecg_data = np.clip(ecg_data, -1, 1)
+
+# Convert to PyTorch tensor
+ecg_tensor = torch.tensor(ecg_data, dtype=torch.float32).unsqueeze(1)  # (N,1,L)
+dataset = TensorDataset(ecg_tensor)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# ==============================
+# 5️⃣ Initialize models & optimizers
+# ==============================
+netG = Generator1D().to(device)
+netD = Discriminator1D().to(device)
+
+criterion = nn.BCELoss()
+optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+
+# ==============================
+# 6️⃣ Training Loop
+# ==============================
+for epoch in range(epochs):
+    netG.train()
+    netD.train()
+    
+    epoch_loss_D = 0.0
+    epoch_loss_G = 0.0
+    avg_D_real = 0.0
+    avg_D_fake = 0.0
+
+    loop = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{epochs}]", leave=False)
+    for i, (imgs,) in enumerate(loop):
+        real_signals = imgs.to(device)
+        batch_size_curr = real_signals.size(0)
+
+        real_labels = torch.ones(batch_size_curr, device=device)
+        fake_labels = torch.zeros(batch_size_curr, device=device)
+
+        # ---- Train Discriminator ----
+        netD.zero_grad()
+        output_real = netD(real_signals)
+        loss_real = criterion(output_real, real_labels)
+
+        noise = torch.randn(batch_size_curr, latent_dim, 1, device=device)
+        fake_signals = netG(noise)
+        output_fake = netD(fake_signals.detach())
+        loss_fake = criterion(output_fake, fake_labels)
+
+        loss_D = loss_real + loss_fake
+        loss_D.backward()
+        optimizerD.step()
+
+        # ---- Train Generator ----
+        netG.zero_grad()
+        output = netD(fake_signals)
+        loss_G = criterion(output, real_labels)
+        loss_G.backward()
+        optimizerG.step()
+
+        # Accumulate metrics
+        epoch_loss_D += loss_D.item()
+        epoch_loss_G += loss_G.item()
+        avg_D_real += output_real.mean().item()
+        avg_D_fake += output_fake.mean().item()
+
+        loop.set_postfix(Loss_D=loss_D.item(), Loss_G=loss_G.item(), D_real=output_real.mean().item(), D_fake=output_fake.mean().item())
+
+    # Average metrics
+    avg_loss_D = epoch_loss_D / len(dataloader)
+    avg_loss_G = epoch_loss_G / len(dataloader)
+    avg_real = avg_D_real / len(dataloader)
+    avg_fake = avg_D_fake / len(dataloader)
+
+    remark = ""
+    if avg_real > avg_fake and avg_loss_G < avg_loss_D:
+        remark = "Generator improving ✅"
+    elif avg_real < avg_fake:
+        remark = "Discriminator struggling ⚠️"
+    else:
+        remark = "Balanced training ⚖️"
+
+    print(f"Epoch [{epoch+1}/{epochs}] | Loss_D: {avg_loss_D:.4f} | Loss_G: {avg_loss_G:.4f} | D(real): {avg_real:.4f} | D(fake): {avg_fake:.4f} | {remark}")
+
+    # Save sample fake signals
+    sample_signals = fake_signals.detach().cpu().numpy()[:5]
+    for j, sig in enumerate(sample_signals):
+        plt.figure(figsize=(6,2))
+        plt.plot(sig.flatten())
+        plt.title(f"Fake ECG Epoch {epoch+1} Sample {j+1}")
+        plt.savefig(f"{output_dir}/fake_ecg_epoch{epoch+1}_sample{j+1}.png")
+        plt.close()
+
+# ==============================
+# 7️⃣ Save Models
+# ==============================
+torch.save(netG.state_dict(), f"{output_dir}/generator.pth")
+torch.save(netD.state_dict(), f"{output_dir}/discriminator.pth")
+print("🎉 Training finished and models saved!")
+
+
+
+
+# ==============================
+# 1️⃣ Imports
+# ==============================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchvision.utils import save_image
+import os
+from tqdm import tqdm  
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==============================
+# 2️⃣ Hyperparameters
+# ==============================
+latent_dim = 100
+channels = 3
+img_size = 64
+batch_size = 128
+epochs = 25
+lr = 0.0002
+beta1 = 0.5
+output_dir = './output/long-term-png-GAN'
+os.makedirs(output_dir, exist_ok=True)
+
+# ==============================
+# 3️⃣ Generator & Discriminator
+# ==============================
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.ConvTranspose2d(latent_dim, 512, 4, 1, 0, bias=False),
+            nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.ConvTranspose2d(512, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(True),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.ConvTranspose2d(64, channels, 4, 2, 1, bias=False),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        return self.model(z)
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(channels, 64, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, 4, 2, 1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1, 4, 1, 0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, img):
+        return self.model(img).view(-1)
+
+# ==============================
+# 4️⃣ Dataset (Kaggle-friendly)
+# ==============================
+# If using Kaggle dataset: change this path to your dataset folder
+dataset_path = "/kaggle/input/longtermganpngcont/long-term-split-GAN-png-cont/long-term-split-pairs-png-cont/train"  
+
+transform = transforms.Compose([
+    transforms.Resize(img_size),
+    transforms.CenterCrop(img_size),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*channels, [0.5]*channels)
+])
+
+dataset = datasets.ImageFolder(root=dataset_path, transform=transform)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+
+# ==============================
+# 5️⃣ Initialize models & optimizer
+# ==============================
+netG = Generator().to(device)
+netD = Discriminator().to(device)
+
+criterion = nn.BCELoss()
+optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+
+# ==============================
+# 6️⃣ Training Loop with detailed epoch stats
+# ==============================
+for epoch in range(epochs):
+    netG.train()
+    netD.train()
+    
+    epoch_loss_D = 0.0
+    epoch_loss_G = 0.0
+    avg_D_real = 0.0
+    avg_D_fake = 0.0
+
+    loop = tqdm(dataloader, desc=f"Epoch [{epoch+1}/{epochs}]", leave=False)
+    for i, (imgs, _) in enumerate(loop):
+        real_images = imgs.to(device)
+        batch_size_curr = real_images.size(0)
+
+        real_labels = torch.ones(batch_size_curr, device=device)
+        fake_labels = torch.zeros(batch_size_curr, device=device)
+
+        # ---- Train Discriminator ----
+        netD.zero_grad()
+        output_real = netD(real_images)
+        loss_real = criterion(output_real, real_labels)
+
+        noise = torch.randn(batch_size_curr, latent_dim, 1, 1, device=device)
+        fake_images = netG(noise)
+        output_fake = netD(fake_images.detach())
+        loss_fake = criterion(output_fake, fake_labels)
+
+        loss_D = loss_real + loss_fake
+        loss_D.backward()
+        optimizerD.step()
+
+        # ---- Train Generator ----
+        netG.zero_grad()
+        output = netD(fake_images)
+        loss_G = criterion(output, real_labels)
+        loss_G.backward()
+        optimizerG.step()
+
+        # Accumulate for epoch stats
+        epoch_loss_D += loss_D.item()
+        epoch_loss_G += loss_G.item()
+        avg_D_real += output_real.mean().item()
+        avg_D_fake += output_fake.mean().item()
+
+        # Live tqdm update
+        loop.set_postfix(Loss_D=loss_D.item(), Loss_G=loss_G.item(), D_real=output_real.mean().item(), D_fake=output_fake.mean().item())
+
+    # Average metrics for the epoch
+    avg_loss_D = epoch_loss_D / len(dataloader)
+    avg_loss_G = epoch_loss_G / len(dataloader)
+    avg_real = avg_D_real / len(dataloader)
+    avg_fake = avg_D_fake / len(dataloader)
+
+    # Remarks
+    remark = ""
+    if avg_real > avg_fake and avg_loss_G < avg_loss_D:
+        remark = "Generator improving ✅"
+    elif avg_real < avg_fake:
+        remark = "Discriminator struggling ⚠️"
+    else:
+        remark = "Balanced training ⚖️"
+
+    # Print detailed epoch summary
+    print(f"Epoch [{epoch+1}/{epochs}] | Loss_D: {avg_loss_D:.4f} | Loss_G: {avg_loss_G:.4f} | D(real): {avg_real:.4f} | D(fake): {avg_fake:.4f} | {remark}")
+
+    # Save sample images each epoch
+    save_image(fake_images.data[:64], f"{output_dir}/fake_samples_epoch_{epoch}.png", nrow=8, normalize=True)
+
+# ==============================
+# 7️⃣ Save Models
+# ==============================
+torch.save(netG.state_dict(), f"{output_dir}/generator.pth")
+torch.save(netD.state_dict(), f"{output_dir}/discriminator.pth")
+print("🎉 Training finished and models saved!")
+
+
+# ==============================
+# 7️⃣ Save Models
+# ==============================
+torch.save(netG.state_dict(), f"{output_dir}/generator.pth")
+torch.save(netD.state_dict(), f"{output_dir}/discriminator.pth")
+print("🎉 Training finished and models saved!")
