@@ -1,0 +1,1979 @@
+import os
+import random
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from torchvision import transforms
+import timm
+from sklearn.utils.class_weight import compute_class_weight
+
+# =========================
+# CONFIG
+# =========================
+CONFIG = {
+    "train_dir": r"C:\Users\sajan\Downloads\ECG_Research\ECG_ID_FINAL_GAN_SPLIT\train",
+    "val_dir": r"C:\Users\sajan\Downloads\ECG_Research\ECG_ID_FINAL_GAN_SPLIT\val",
+    "test_dir": r"C:\Users\sajan\Downloads\ECG_Research\ECG_ID_FINAL_GAN_SPLIT\test",
+    "batch_size": 4,
+    "lr": 1e-4,
+    "num_epochs": 155,
+    "patience": 75,
+    "save_path": "Best_model_PGD_GAN_ECGID_CORRECT_DS.pth",
+    "lead_index": 1,
+    "apply_1d_augmentation": True,
+    "proj_dim": 768,
+    "bigru_hidden": 32,
+    "bigru_layers": 2,
+    "mobilenet_model_name": "mobilenetv4_conv_small",
+    "num_heads": 8,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "pgd_enabled": True,
+    "pgd_epsilon": 0.02,
+    "pgd_alpha": 0.005,
+    "pgd_num_steps": 5,
+    "pgd_random_start": True,
+    "pgd_npy_weight": 0.7,
+    "pgd_png_weight": 0.3,
+    "scheduler_factor": 0.1,
+    "scheduler_patience": 35,
+    "dropout_rate": 0.1,  # Added dropout rate
+    "weight_decay": 1e-6  # Added L2 regularization
+}
+
+device = torch.device(CONFIG["device"])
+print("USING DEVICE:", device)
+print(f"PGD Attack: {'ENABLED' if CONFIG['pgd_enabled'] else 'DISABLED'}")
+if CONFIG['pgd_enabled']:
+    print(f"  - Epsilon: {CONFIG['pgd_epsilon']}")
+    print(f"  - Alpha: {CONFIG['pgd_alpha']}")
+    print(f"  - Steps: {CONFIG['pgd_num_steps']}")
+
+# =========================
+# PGD Attack Function
+# =========================
+def pgd_attack(model, npy_batch, png_batch, labels, criterion, 
+               epsilon, alpha, num_steps, random_start=True):
+    npy_adv = npy_batch.clone().detach()
+    png_adv = png_batch.clone().detach()
+    npy_orig = npy_batch.clone().detach()
+    png_orig = png_batch.clone().detach()
+    
+    if random_start:
+        npy_adv = npy_adv + torch.empty_like(npy_adv).uniform_(-epsilon, epsilon)
+        npy_adv = torch.clamp(npy_adv, npy_orig - epsilon, npy_orig + epsilon)
+        png_adv = png_adv + torch.empty_like(png_adv).uniform_(-epsilon, epsilon)
+        png_adv = torch.clamp(png_adv, png_orig - epsilon, png_orig + epsilon)
+        png_adv = torch.clamp(png_adv, 0, 1)
+    
+    for step in range(num_steps):
+        npy_adv.requires_grad = True
+        png_adv.requires_grad = True
+        outputs = model(npy_adv, png_adv)
+        loss = criterion(outputs, labels)
+        model.zero_grad()
+        loss.backward()
+        npy_grad = npy_adv.grad.detach()
+        png_grad = png_adv.grad.detach()
+        
+        with torch.no_grad():
+            npy_adv = npy_adv + alpha * npy_grad.sign()
+            npy_perturbation = torch.clamp(npy_adv - npy_orig, -epsilon, epsilon)
+            npy_adv = npy_orig + npy_perturbation
+            png_adv = png_adv + alpha * png_grad.sign()
+            png_perturbation = torch.clamp(png_adv - png_orig, -epsilon, epsilon)
+            png_adv = png_orig + png_perturbation
+            png_adv = torch.clamp(png_adv, 0, 1)
+    
+    return npy_adv.detach(), png_adv.detach()
+
+# =========================
+# Dataset
+# =========================
+class PairedECGDataset(Dataset):
+    def __init__(self, root_dir, transform=None, folder2label=None, is_train=False, lead_index=1, apply_1d_augmentation=True):
+        self.samples = []
+        self.transform = transform
+        self.folder2label = folder2label or {}
+        self.is_train = is_train
+        self.lead_index = lead_index
+        self.apply_1d_augmentation = apply_1d_augmentation
+
+        for class_folder in sorted(os.listdir(root_dir)):
+            class_path = os.path.join(root_dir, class_folder)
+            if os.path.isdir(class_path):
+                npy_files = sorted([f for f in os.listdir(class_path) if f.endswith('.npy')])
+                for npy_file in npy_files:
+                    png_file = npy_file.replace('.npy', '.png')
+                    npy_path = os.path.join(class_path, npy_file)
+                    png_path = os.path.join(class_path, png_file)
+                    if os.path.exists(png_path):
+                        self.samples.append((npy_path, png_path))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        npy_path, png_path = self.samples[idx]
+        npy_data = np.load(npy_path)
+        
+        if npy_data.ndim == 2:
+            npy_1d = npy_data[self.lead_index]
+        elif npy_data.ndim == 1:
+            npy_1d = npy_data
+        else:
+            npy_s = npy_data.squeeze()
+            if npy_s.ndim == 1:
+                npy_1d = npy_s
+            elif npy_s.ndim == 2:
+                npy_1d = npy_s[self.lead_index]
+            else:
+                raise ValueError(f"Unexpected npy shape at {npy_path}: {npy_data.shape}")
+
+        npy_tensor = torch.tensor(npy_1d, dtype=torch.float32)
+        
+        if self.is_train and self.apply_1d_augmentation:
+            if random.random() > 0.5:
+                npy_tensor = -npy_tensor
+            scale = random.uniform(0.9, 1.1)
+            npy_tensor = npy_tensor * scale
+            max_shift = max(1, int(len(npy_tensor) * 0.05))
+            shift = random.randint(-max_shift, max_shift)
+            npy_tensor = torch.roll(npy_tensor, shifts=shift)
+
+        png_image = Image.open(png_path).convert("RGB")
+        if self.transform:
+            png_image = self.transform(png_image)
+
+        folder_name = os.path.basename(os.path.dirname(npy_path))
+        label = self.folder2label.get(folder_name, -1)
+        if label == -1:
+            raise KeyError(f"Folder {folder_name} not found in folder2label mapping.")
+        return npy_tensor, png_image, label
+
+def collate_fn(batch):
+    npy_list, png_list, labels = zip(*batch)
+    npy_padded = pad_sequence(npy_list, batch_first=True)
+    npy_padded = npy_padded.unsqueeze(-1)
+    png_tensor = torch.stack(png_list)
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    return npy_padded, png_tensor, labels_tensor
+
+# =========================
+# Transforms & DataLoaders
+# =========================
+train_transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=5),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor()
+])
+val_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor()
+])
+
+train_dir = CONFIG["train_dir"]
+val_dir = CONFIG["val_dir"]
+test_dir = CONFIG["test_dir"]
+
+def count_files_in_dir(directory):
+    total = 0
+    for root, _, files in os.walk(directory):
+        total += len([f for f in files if not f.startswith('.')])
+    return total
+
+train_count = count_files_in_dir(train_dir)
+val_count = count_files_in_dir(val_dir)
+test_count = count_files_in_dir(test_dir)
+
+print(f"Total train files: {train_count}")
+print(f"Total validation files: {val_count}")
+print(f"Total test files: {test_count}")
+print(f"Total all files: {train_count + val_count + test_count}")
+
+class_folders = sorted([d for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d))])
+folder2label = {folder: idx for idx, folder in enumerate(class_folders)}
+
+train_dataset = PairedECGDataset(train_dir, train_transform, folder2label, is_train=True,
+                                 lead_index=CONFIG["lead_index"], apply_1d_augmentation=CONFIG["apply_1d_augmentation"])
+val_dataset = PairedECGDataset(val_dir, val_transform, folder2label, is_train=False, lead_index=CONFIG["lead_index"],
+                               apply_1d_augmentation=False)
+test_dataset = PairedECGDataset(test_dir, val_transform, folder2label, is_train=False, lead_index=CONFIG["lead_index"],
+                                apply_1d_augmentation=False)
+
+train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn)
+val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=collate_fn)
+test_loader = DataLoader(test_dataset, batch_size=CONFIG["batch_size"], shuffle=False, collate_fn=collate_fn)
+
+all_train_labels = []
+for _, _, labels in train_loader:
+    all_train_labels.extend(labels.cpu().numpy())
+all_train_labels = np.array(all_train_labels)
+
+# =========================
+# Branches
+# =========================
+class BiGRUBranch(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=CONFIG["bigru_hidden"], num_layers=CONFIG["bigru_layers"]):
+        super().__init__()
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, bidirectional=True)
+        self.dropout_gru = nn.Dropout(CONFIG["dropout_rate"])
+        self.linear = nn.Linear(hidden_dim * 2, CONFIG["proj_dim"])
+        assert CONFIG["proj_dim"] % CONFIG["num_heads"] == 0, "proj_dim must be divisible by num_heads"
+        self.sa = nn.MultiheadAttention(embed_dim=CONFIG["proj_dim"], num_heads=CONFIG["num_heads"], batch_first=True)
+        self.dropout_sa = nn.Dropout(CONFIG["dropout_rate"])
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        out = self.dropout_gru(out)
+        last = out[:, -1, :]
+        proj = self.linear(last).unsqueeze(1)
+        attn_out, _ = self.sa(proj, proj, proj)
+        attn_out = self.dropout_sa(attn_out)
+        return attn_out.squeeze(1)
+
+class MobileNetBranch(nn.Module):
+    def __init__(self, model_name=CONFIG["mobilenet_model_name"], device=CONFIG["device"]):
+        super().__init__()
+        self.device = device
+        self.model = timm.create_model(model_name, pretrained=True, features_only=True)
+        self.model.to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            dummy = torch.randn(1, 3, 224, 224).to(self.device)
+            feats = self.model(dummy)
+            final = feats[-1]
+            C = final.size(1)
+        print(f"[MobileNetV4Branch] feature dimension (C): {C}")
+        self.model.train()
+        self.linear = nn.Linear(C, CONFIG["proj_dim"])
+        assert CONFIG["proj_dim"] % CONFIG["num_heads"] == 0, "proj_dim must be divisible by num_heads"
+        self.sa = nn.MultiheadAttention(embed_dim=CONFIG["proj_dim"], num_heads=CONFIG["num_heads"], batch_first=True)
+        self.dropout_sa = nn.Dropout(CONFIG["dropout_rate"])
+
+    def forward(self, x):
+        feats = self.model(x)[-1]
+        if feats.dim() == 4:
+            feats = torch.mean(feats, dim=(2, 3))
+        proj = self.linear(feats).unsqueeze(1)
+        attn_out, _ = self.sa(proj, proj, proj)
+        attn_out = self.dropout_sa(attn_out)
+        return attn_out.squeeze(1)
+
+# =========================
+# Cross Attention & Dual Model
+# =========================
+class CrossAttentionBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        assert CONFIG["proj_dim"] % CONFIG["num_heads"] == 0
+        self.cross_attn = nn.MultiheadAttention(embed_dim=CONFIG["proj_dim"], num_heads=CONFIG["num_heads"], batch_first=True)
+        self.dropout = nn.Dropout(CONFIG["dropout_rate"])
+
+    def forward(self, query, key_value):
+        q = query.unsqueeze(1)
+        kv = key_value.unsqueeze(1)
+        attn_out, _ = self.cross_attn(q, kv, kv)
+        attn_out = self.dropout(attn_out)
+        return attn_out.squeeze(1)
+
+class DualBranchModel(nn.Module):
+    def __init__(self, num_classes, device=CONFIG["device"]):
+        super().__init__()
+        self.mobilenet_branch = MobileNetBranch(model_name=CONFIG["mobilenet_model_name"], device=device)
+        self.bigru_branch = BiGRUBranch(input_dim=1, hidden_dim=CONFIG["bigru_hidden"], num_layers=CONFIG["bigru_layers"])
+        self.cross_attn_mn_to_gru = CrossAttentionBlock()
+        self.cross_attn_gru_to_mn = CrossAttentionBlock()
+        self.classifier = nn.Sequential(
+            nn.Linear(CONFIG["proj_dim"] * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(CONFIG["dropout_rate"]),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, npy_batch, png_batch):
+        bigru_feats = self.bigru_branch(npy_batch)
+        mn_feats = self.mobilenet_branch(png_batch)
+        attn_bigru = self.cross_attn_gru_to_mn(bigru_feats, mn_feats)
+        attn_mn = self.cross_attn_mn_to_gru(mn_feats, bigru_feats)
+        combined = torch.cat([attn_bigru, attn_mn], dim=1)
+        out = self.classifier(combined)
+        return out
+
+    def extract_features(self, npy_batch, png_batch):
+        bigru_feats = self.bigru_branch(npy_batch)
+        mn_feats = self.mobilenet_branch(png_batch)
+        attn_bigru = self.cross_attn_gru_to_mn(bigru_feats, mn_feats)
+        attn_mn = self.cross_attn_mn_to_gru(mn_feats, bigru_feats)
+        return torch.cat([attn_bigru, attn_mn], dim=1)
+
+# =========================
+# Training Setup
+# =========================
+num_classes = len(folder2label)
+class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(all_train_labels), y=all_train_labels)
+class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+
+model = DualBranchModel(num_classes=num_classes, device=device).to(device)
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"])
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=CONFIG["scheduler_factor"], 
+                                                      patience=CONFIG["scheduler_patience"], min_lr=CONFIG["weight_decay"])
+
+start_epoch = 0
+best_val_acc = 0.0
+patience_counter = 0
+scheduler_counter = 0
+
+save_path = CONFIG["save_path"]
+if os.path.exists(save_path):
+    try:
+        checkpoint = torch.load(save_path, map_location=device)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint.get('scheduler_state_dict', scheduler.state_dict()))
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_acc = checkpoint.get('best_val_acc', 0.0)
+            patience_counter = checkpoint.get('patience_counter', 0)
+            scheduler_counter = checkpoint.get('scheduler_counter', 0)
+            print(f"Resuming training from epoch {start_epoch} with best Val Acc: {best_val_acc:.4f}")
+        else:
+            model.load_state_dict(checkpoint)
+            print("Loaded legacy checkpoint (model state_dict only).")
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}. Starting from scratch.")
+
+# =========================
+# Training Loop
+# =========================
+# =========================
+# Training Loop (Updated)
+# =========================
+train_losses, train_accs = [], []
+val_losses, val_accs = [], []
+test_losses, test_accs = [], []
+
+for epoch in range(start_epoch, CONFIG["num_epochs"]):
+    model.train()
+    train_loss = 0.0
+    correct_train, total_train = 0, 0
+
+    for npy_batch, png_batch, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{CONFIG['num_epochs']} [Train]"):
+        npy_batch = npy_batch.to(device)
+        png_batch = png_batch.to(device)
+        labels = labels.to(device)
+
+        if CONFIG["pgd_enabled"]:
+            npy_adv, png_adv = pgd_attack(
+                model=model,
+                npy_batch=npy_batch,
+                png_batch=png_batch,
+                labels=labels,
+                criterion=criterion,
+                epsilon=CONFIG["pgd_epsilon"],
+                alpha=CONFIG["pgd_alpha"],
+                num_steps=CONFIG["pgd_num_steps"],
+                random_start=CONFIG["pgd_random_start"]
+            )
+        else:
+            npy_adv, png_adv = npy_batch, png_batch
+
+        optimizer.zero_grad()
+        outputs = model(npy_adv, png_adv)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        preds = outputs.argmax(dim=1)
+        correct_train += (preds == labels).sum().item()
+        total_train += labels.size(0)
+
+    train_loss /= max(1, len(train_loader))
+    train_acc = correct_train / max(1, total_train)
+    train_losses.append(train_loss)
+    train_accs.append(train_acc)
+
+    # ---------- VALIDATION ----------
+    model.eval()
+    val_loss, correct_val, total_val = 0.0, 0, 0
+    with torch.no_grad():
+        for npy_batch, png_batch, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{CONFIG['num_epochs']} [Val]"):
+            npy_batch, png_batch, labels = npy_batch.to(device), png_batch.to(device), labels.to(device)
+            outputs = model(npy_batch, png_batch)
+            loss = criterion(outputs, labels)
+            val_loss += loss.item()
+            preds = outputs.argmax(dim=1)
+            correct_val += (preds == labels).sum().item()
+            total_val += labels.size(0)
+
+    val_loss /= max(1, len(val_loader))
+    val_acc = correct_val / max(1, total_val)
+    val_losses.append(val_loss)
+    val_accs.append(val_acc)
+
+    # ---------- TEST ----------
+    test_loss, correct_test, total_test = 0.0, 0, 0
+    with torch.no_grad():
+        for npy_batch, png_batch, labels in tqdm(test_loader, desc=f"Epoch {epoch+1}/{CONFIG['num_epochs']} [Test]"):
+            npy_batch, png_batch, labels = npy_batch.to(device), png_batch.to(device), labels.to(device)
+            outputs = model(npy_batch, png_batch)
+            loss = criterion(outputs, labels)
+            test_loss += loss.item()
+            preds = outputs.argmax(dim=1)
+            correct_test += (preds == labels).sum().item()
+            total_test += labels.size(0)
+
+    test_loss /= max(1, len(test_loader))
+    test_acc = correct_test / max(1, total_test)
+    test_losses.append(test_loss)
+    test_accs.append(test_acc)
+
+    # ---------- SCHEDULER ----------
+    prev_lr = optimizer.param_groups[0]['lr']
+    scheduler.step(val_acc)
+    current_lr = optimizer.param_groups[0]['lr']
+    scheduler_counter += 1
+    if current_lr != prev_lr:
+        scheduler_counter = 0
+
+    # ---------- ACCURACY GAP CHECK ----------
+    accs = [train_acc, val_acc, test_acc]
+    max_acc, min_acc = max(accs), min(accs)
+    acc_gap = max_acc - min_acc
+
+    # ---------- MODEL SAVE CONDITION ----------
+    save_model = False
+    if val_acc > best_val_acc and acc_gap <= 0.05:  # within 5% difference
+        best_val_acc = val_acc
+        save_model = True
+
+    if save_model:
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_acc': best_val_acc,
+            'patience_counter': patience_counter,
+            'scheduler_counter': scheduler_counter,
+            'config': CONFIG
+        }, save_path)
+        print(f"*** Best model saved at epoch {epoch+1} | "
+              f"Val Acc: {val_acc:.4f} | Train: {train_acc:.4f} | Test: {test_acc:.4f} | "
+              f"Δ={acc_gap*100:.2f}% ***")
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        reason = ""
+        if val_acc <= best_val_acc:
+            reason += "ValAcc not improved. "
+        if acc_gap > 0.05:
+            reason += f"Acc gap too high ({acc_gap*100:.2f}%)."
+        print(f"No save: {reason} Patience: {patience_counter}/{CONFIG['patience']}")
+
+        if patience_counter >= CONFIG['patience']:
+            print(f"Early stopping triggered after {patience_counter} epochs.")
+            break
+
+    print(f"\nEpoch {epoch+1}/{CONFIG['num_epochs']} | "
+          f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f} | "
+          f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f} | "
+          f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f} | "
+          f"LR: {current_lr:.6f} | "
+          f"Patience: {patience_counter}/{CONFIG['patience']} | "
+          f"Scheduler Counter: {scheduler_counter}/{CONFIG['scheduler_patience']} | "
+          f"Acc Gap: {acc_gap*100:.2f}%")
+
+print("\n" + "="*60)
+print("Training Complete!")
+print(f"Best Validation Accuracy (within 5% gap): {best_val_acc:.4f}")
+print("="*60)
+
+
+# ---------------------------
+# Evaluation & Plots (Classification + Authentication)
+# ---------------------------
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import (
+    classification_report, confusion_matrix, roc_auc_score, roc_curve,
+    auc, precision_recall_fscore_support
+)
+from sklearn.preprocessing import label_binarize
+from sklearn.metrics import DetCurveDisplay
+from scipy import interpolate
+from itertools import combinations
+import random
+import math
+
+# ---------- Utility funcs ----------
+def plot_history(train_losses, val_losses, test_losses, train_accs, val_accs, test_accs, out_path_prefix="training_history"):
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.plot(epochs, train_losses, label="train_loss")
+    plt.plot(epochs, val_losses, label="val_loss")
+    plt.plot(epochs, test_losses, label="test_loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.title("Loss History")
+
+    plt.subplot(1,2,2)
+    plt.plot(epochs, train_accs, label="train_acc")
+    plt.plot(epochs, val_accs, label="val_acc")
+    plt.plot(epochs, test_accs, label="test_acc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.title("Accuracy History")
+
+    plt.tight_layout()
+    plt.savefig(f"{out_path_prefix}.png", dpi=200)
+    plt.show()
+
+def compute_classification_metrics(model, loader, device, folder2label):
+    model.eval()
+    all_preds = []
+    all_probs = []
+    all_labels = []
+    with torch.no_grad():
+        for npy_batch, png_batch, labels in loader:
+            npy_batch = npy_batch.to(device)
+            png_batch = png_batch.to(device)
+            labels = labels.to(device)
+            outputs = model(npy_batch, png_batch)
+            probs = torch.softmax(outputs, dim=1)
+            preds = outputs.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    all_preds = np.array(all_preds)
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+
+    # Classification report & confusion matrix
+    target_names = [str(k) for k, _ in sorted(folder2label.items(), key=lambda x: x[1])]
+    print("\n=== Classification Report ===")
+    print(classification_report(all_labels, all_preds, target_names=target_names, digits=4))
+
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(10,8))
+    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues')
+    plt.title("Confusion Matrix (counts)")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.tight_layout()
+    plt.savefig("confusion_matrix.png", dpi=200)
+    plt.show()
+
+    # ROC-AUC (one-vs-rest & macro)
+    classes = np.unique(all_labels)
+    if len(classes) > 2:
+        lb = label_binarize(all_labels, classes=classes)
+        try:
+            per_class_auc = {}
+            for i, c in enumerate(classes):
+                y_true_c = lb[:, i]
+                y_score_c = all_probs[:, i]
+                if y_true_c.sum() == 0 or y_true_c.sum() == len(y_true_c):
+                    per_class_auc[c] = float('nan')
+                else:
+                    per_class_auc[c] = roc_auc_score(y_true_c, y_score_c)
+            macro_auc = np.nanmean([v for v in per_class_auc.values() if not math.isnan(v)])
+            print(f"\nPer-class ROC AUC (sample): {list(per_class_auc.items())[:10]}")
+            print(f"Macro ROC-AUC (mean of per-class): {macro_auc:.4f}")
+        except Exception as e:
+            print("ROC-AUC per-class computation failed:", e)
+    else:
+        # Binary
+        try:
+            y_score = all_probs[:, 1]
+            binary_auc = roc_auc_score(all_labels, y_score)
+            print(f"\nBinary ROC-AUC: {binary_auc:.4f}")
+        except Exception as e:
+            print("Binary ROC AUC computation failed:", e)
+
+    return all_labels, all_preds, all_probs
+
+# ---------- Embedding extraction for verification ----------
+def extract_all_embeddings(model, loader, device):
+    model.eval()
+    emb_list = []
+    labels_list = []
+    image_ids = []  # optional: store file index
+    with torch.no_grad():
+        for npy_batch, png_batch, labels in loader:
+            npy_batch = npy_batch.to(device)
+            png_batch = png_batch.to(device)
+            labels = labels.to(device)
+            feats = model.extract_features(npy_batch, png_batch)  # (B, feat_dim)
+            emb_list.append(feats.cpu().numpy())
+            labels_list.extend(labels.cpu().numpy())
+    embeddings = np.vstack(emb_list)
+    labels = np.array(labels_list)
+    return embeddings, labels
+
+def make_pairs_from_embeddings(embeddings, labels, num_genuine_per_class=500, num_impostor=5000, random_seed=42):
+    """Create genuine and impostor pairs (indices) and labels (1 genuine, 0 impostor)."""
+    rng = random.Random(random_seed)
+    idx_by_class = {}
+    for idx, lbl in enumerate(labels):
+        idx_by_class.setdefault(lbl, []).append(idx)
+
+    genuine_pairs = []
+    for lbl, idxs in idx_by_class.items():
+        if len(idxs) < 2:
+            continue
+        # all combinations or random subset
+        all_combs = list(combinations(idxs, 2))
+        rng.shuffle(all_combs)
+        take = min(len(all_combs), num_genuine_per_class)
+        genuine_pairs.extend(all_combs[:take])
+
+    # impostor pairs (random)
+    all_indices = list(range(len(labels)))
+    impostor_pairs = set()
+    attempts = 0
+    while len(impostor_pairs) < num_impostor and attempts < num_impostor * 10:
+        a = rng.choice(all_indices)
+        b = rng.choice(all_indices)
+        if labels[a] != labels[b] and a != b:
+            pair = (a, b) if a < b else (b, a)
+            impostor_pairs.add(pair)
+        attempts += 1
+    impostor_pairs = list(impostor_pairs)
+
+    pairs = genuine_pairs + impostor_pairs
+    pair_labels = [1] * len(genuine_pairs) + [0] * len(impostor_pairs)
+    return pairs, pair_labels
+
+from sklearn.metrics.pairwise import cosine_similarity
+
+def compute_verification_metrics(embeddings, labels, pairs, pair_labels):
+    # compute cosine similarity for each pair
+    sims = []
+    for (i, j) in pairs:
+        v1 = embeddings[i].reshape(1, -1)
+        v2 = embeddings[j].reshape(1, -1)
+        s = cosine_similarity(v1, v2)[0,0]
+        sims.append(s)
+    sims = np.array(sims)
+    pair_labels = np.array(pair_labels)
+
+    # ROC & AUC
+    fpr, tpr, thresholds = roc_curve(pair_labels, sims)
+    roc_auc = auc(fpr, tpr)
+    print(f"\nVerification ROC AUC: {roc_auc:.4f}")
+
+    # EER: point where FPR ~= (1 - TPR) i.e. FPR ~= FNR
+    fnr = 1 - tpr
+    eer_idx = np.nanargmin(np.absolute(fnr - fpr))
+    eer_threshold = thresholds[eer_idx]
+    eer = (fpr[eer_idx] + fnr[eer_idx]) / 2.0
+    print(f"EER: {eer:.4f} at threshold {eer_threshold:.4f} (FPR={fpr[eer_idx]:.4f}, FNR={fnr[eer_idx]:.4f})")
+
+    # FAR / FRR at EER threshold and optionally at several operating points
+    def rates_at_threshold(th):
+        accept = sims >= th
+        # FAR = False Acceptance Rate = impostor accepted / total impostor
+        impostor_mask = pair_labels == 0
+        genuine_mask = pair_labels == 1
+        FAR = np.sum(accept & impostor_mask) / max(1, np.sum(impostor_mask))
+        FRR = np.sum(~accept & genuine_mask) / max(1, np.sum(genuine_mask))
+        return FAR, FRR
+
+    far_eer, frr_eer = rates_at_threshold(eer_threshold)
+    print(f"At EER-threshold -> FAR: {far_eer:.4f}, FRR: {frr_eer:.4f}")
+
+    # Plot ROC
+    plt.figure(figsize=(6,6))
+    plt.plot(fpr, tpr, label=f"ROC (AUC={roc_auc:.4f})")
+    plt.plot([0,1],[0,1],'k--')
+    plt.scatter([fpr[eer_idx]],[tpr[eer_idx]], c='red', label=f"EER={eer:.4f}")
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title("Verification ROC Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("verification_roc.png", dpi=200)
+    plt.show()
+
+    # DET-like plot: plot FNR vs FPR
+    plt.figure(figsize=(6,6))
+    plt.plot(fpr, fnr, label="DET-like (FNR vs FPR)")
+    plt.scatter([fpr[eer_idx]],[fnr[eer_idx]], c='red', label=f"EER point")
+    plt.xlabel("FPR")
+    plt.ylabel("FNR")
+    plt.title("DET-like Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("verification_det.png", dpi=200)
+    plt.show()
+
+    return {
+        "roc_auc": roc_auc,
+        "fpr": fpr, "tpr": tpr, "thresholds": thresholds,
+        "eer": eer, "eer_threshold": eer_threshold,
+        "far_at_eer": far_eer, "frr_at_eer": frr_eer,
+        "sims": sims, "pair_labels": pair_labels
+    }
+
+# ---------- Run evaluation ----------
+print("\nRunning final evaluation...")
+
+# 1) Plot history
+plot_history(train_losses, val_losses, test_losses, train_accs, val_accs, test_accs, out_path_prefix="training_history")
+
+# 2) Classification metrics on TEST set
+test_labels, test_preds, test_probs = compute_classification_metrics(model, test_loader, device, folder2label)
+
+# Assume `test_labels`, `test_preds` already computed from your test_loader
+# 'spoof_class' is the label index assigned to the GAN-generated ECGs
+spoof_class = folder2label.get("ECG_ID_GAN")  # replace with actual folder name
+
+# Select only spoof samples
+spoof_mask = (test_labels == spoof_class)
+num_spoof_samples = np.sum(spoof_mask)
+
+# Count how many were correctly predicted as spoof
+correct_spoof = np.sum(test_preds[spoof_mask] == spoof_class)
+
+# Spoofing Detection Rate
+SDR = correct_spoof / max(1, num_spoof_samples)
+print(f"Spoofing Detection Rate (SDR): {SDR:.4f} ({correct_spoof}/{num_spoof_samples})")
+
+FAR_spoof = np.sum(test_preds[spoof_mask] != spoof_class) / max(1, num_spoof_samples)
+print(f"False Acceptance Rate (FAR, spoof): {FAR_spoof:.4f}")
+
+
+FAR_spoof = np.sum(test_preds[spoof_mask] != spoof_class) / max(1, num_spoof_samples)
+print(f"False Acceptance Rate (FAR, spoof): {FAR_spoof:.4f}")
+
+
+# 3) Extract embeddings for verification (use entire dataset or test set as you prefer)
+embeddings, emb_labels = extract_all_embeddings(model, test_loader, device)
+print(f"Extracted embeddings shape: {embeddings.shape}, labels shape: {emb_labels.shape}")
+
+# 4) Build pairs
+pairs, pair_labels = make_pairs_from_embeddings(embeddings, emb_labels,
+                                                num_genuine_per_class=200,  # tune as needed
+                                                num_impostor=2000,
+                                                random_seed=42)
+print(f"Built {len(pairs)} pairs: {sum(pair_labels)} genuine, {len(pair_labels)-sum(pair_labels)} impostor")
+
+# 5) Compute verification metrics
+verif_res = compute_verification_metrics(embeddings, emb_labels, pairs, pair_labels)
+
+# 6) Optionally save embeddings and results for later analysis
+np.savez("embeddings_and_labels.npz", embeddings=embeddings, labels=emb_labels,
+         sims=verif_res["sims"], pair_labels=verif_res["pair_labels"])
+
+# 7) Additional: classification-level FAR/FNR by thresholding softmax prob of predicted class
+#    (useful if you want to derive authentication metrics from softmax confidence)
+probs = test_probs  # (N, num_classes)
+preds = np.array(test_preds)
+true = np.array(test_labels)
+pred_confidences = probs[np.arange(len(probs)), preds]  # confidence in chosen class
+# Choose threshold grid
+thrs = np.linspace(0, 1, 101)
+far_list, fnr_list = [], []
+for thr in thrs:
+    # accept if predicted class confidence >= thr else reject (treat as 'not accepted')
+    accepts = pred_confidences >= thr
+    # Genuine: predicted == true
+    genuine_mask = preds == true
+    # FAR: instances where predicted != true but accepts==True (imposter accepted)
+    FAR = np.sum((preds != true) & accepts) / max(1, np.sum(preds != true))
+    # FRR (FNR): genuine rejected = genuine_mask & not accepts
+    FRR = np.sum(genuine_mask & (~accepts)) / max(1, np.sum(genuine_mask))
+    far_list.append(FAR)
+    fnr_list.append(FRR)
+
+plt.figure(figsize=(6,6))
+plt.plot(far_list, fnr_list, marker='.')
+plt.xlabel("FAR")
+plt.ylabel("FRR")
+plt.title("FAR vs FRR (from classification confidences)")
+plt.grid(True)
+plt.savefig("class_confidence_far_frr.png", dpi=200)
+plt.show()
+
+print("\nEvaluation complete. Saved figures: training_history.png, confusion_matrix.png, verification_roc.png, verification_det.png, class_confidence_far_frr.png")
+
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from captum.attr import IntegratedGradients, DeepLift
+import cv2
+import pkg_resources
+from sklearn.metrics import classification_report, confusion_matrix
+
+# Check captum and PyTorch versions for compatibility
+captum_version = pkg_resources.get_distribution("captum").version
+pytorch_version = torch.__version__
+print(f"Using captum version: {captum_version}, PyTorch version: {pytorch_version}")
+
+# =========================
+# Grad-CAM Implementation (Fixed)
+# =========================
+def get_gradcam(model, npy_batch, png_batch, target_class, device):
+    model.train()  # Required for CuDNN RNN backward
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.eval()
+
+    # Ensure inputs require gradients
+    if not npy_batch.requires_grad:
+        npy_batch = npy_batch.clone().requires_grad_(True).to(device)
+    if not png_batch.requires_grad:
+        png_batch = png_batch.clone().requires_grad_(True).to(device)
+
+    # Forward pass
+    outputs = model(npy_batch, png_batch)
+    if not outputs.requires_grad:
+        print("Warning: Model outputs do not require gradients. Check model configuration.")
+        return None, None, None, None
+
+    target_output = outputs[:, target_class]
+
+    # Backward pass
+    try:
+        model.zero_grad()
+        target_output.backward(torch.ones_like(target_output))
+    except RuntimeError as e:
+        print(f"Gradient computation failed: {e}")
+        return None, None, None, None
+
+    # --- MobileNet Branch (Image) ---
+    mobilenet = model.mobilenet_branch.model
+    last_conv_layer = None
+    for name, module in mobilenet.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            last_conv_layer = module
+            last_conv_name = name
+
+    if last_conv_layer is None:
+        print("Error: No Conv2d layer found in MobileNet.")
+        return None, None, None, None
+
+    # Hook to capture activations and gradients
+    activations = []
+    gradients = []
+
+    def forward_hook(module, input, output):
+        activations.append(output.detach())
+
+    def backward_hook(module, grad_in, grad_out):
+        gradients.append(grad_out[0].detach())
+
+    handle_fwd = last_conv_layer.register_forward_hook(forward_hook)
+    handle_bwd = last_conv_layer.register_full_backward_hook(backward_hook)  # Updated to full hook
+
+    # Re-run forward pass to capture activations
+    model.zero_grad()
+    outputs = model(npy_batch, png_batch)
+    outputs[:, target_class].backward(torch.ones_like(outputs[:, target_class]))
+
+    handle_fwd.remove()
+    handle_bwd.remove()
+
+    if not gradients or not activations:
+        print("Error: Failed to capture gradients or activations.")
+        return None, None, None, None
+
+    # Compute Grad-CAM for MobileNet
+    gradients = gradients[0].mean(dim=(2, 3), keepdim=True)
+    activations = activations[0]
+    weights = gradients.mean(dim=(2, 3), keepdim=True)
+    gradcam = torch.relu((weights * activations).sum(dim=1)).squeeze().cpu().numpy()
+
+    # Normalize and resize to input image size
+    gradcam = (gradcam - gradcam.min()) / (gradcam.max() - gradcam.min() + 1e-8)
+    gradcam = cv2.resize(gradcam, (224, 224))
+
+    # Overlay on original image
+    original_image = png_batch[0].permute(1, 2, 0).detach().cpu().numpy()  # Added detach()
+    original_image = (original_image - original_image.min()) / (original_image.max() - original_image.min() + 1e-8)
+    heatmap = cv2.applyColorMap(np.uint8(255 * gradcam), cv2.COLORMAP_JET)
+    heatmap = np.float32(heatmap) / 255
+    superimposed_img = heatmap * 0.4 + original_image
+
+    # --- BiGRU Branch (1D Signal) ---
+    npy_grads = npy_batch.grad
+    if npy_grads is None:
+        print("Error: No gradients computed for npy_batch.")
+        return gradcam, superimposed_img, None, None
+
+    npy_grads = npy_grads.squeeze().detach().cpu().numpy()  # Added detach()
+    npy_signal = npy_batch.squeeze().detach().cpu().numpy()
+
+    # Normalize gradients for visualization
+    npy_grads = np.abs(npy_grads)
+    npy_grads = (npy_grads - npy_grads.min()) / (npy_grads.max() - npy_grads.min() + 1e-8)
+
+    # Restore eval mode
+    model.eval()
+    return gradcam, superimposed_img, npy_grads, npy_signal
+
+# =========================
+# SHAP Implementation (Unchanged)
+# =========================
+def get_shap_explanations(model, npy_batch, png_batch, target_class, device, num_samples=50):
+    model.train()
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.eval()
+
+    use_deeplift = False
+    if use_deeplift:
+        print("Using DeepLift for attributions")
+        attr_method = DeepLift(model)
+    else:
+        print("Using IntegratedGradients for attributions")
+        attr_method = IntegratedGradients(model)
+
+    npy_batch = npy_batch.clone().requires_grad_(True).to(device)
+    png_batch = png_batch.clone().requires_grad_(True).to(device)
+    
+    npy_baseline = torch.zeros_like(npy_batch).to(device)
+    png_baseline = torch.zeros_like(png_batch).to(device)
+
+    try:
+        attributions, delta = attr_method.attribute(
+            (npy_batch, png_batch),
+            baselines=(npy_baseline, png_baseline),
+            target=target_class,
+            n_steps=num_samples if not use_deeplift else None,
+            return_convergence_delta=True
+        )
+    except Exception as e:
+        print(f"Attribution computation failed: {e}")
+        return None, None
+
+    npy_attr = attributions[0].squeeze().detach().cpu().numpy()
+    png_attr = attributions[1].squeeze().detach().cpu().numpy()
+
+    model.eval()
+    return npy_attr, png_attr
+
+# =========================
+# Visualization Function (Unchanged)
+# =========================
+def visualize_xai(gradcam, superimposed_img, npy_grads, npy_signal, png_attr, npy_attr, original_image, save_prefix="xai"):
+    if gradcam is None or superimposed_img is None:
+        print(f"Skipping visualization for {save_prefix} due to failed Grad-CAM computation")
+        return
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1)
+    plt.imshow(superimposed_img)
+    plt.title("Grad-CAM (MobileNetV4)")
+    plt.axis('off')
+
+    plt.subplot(1, 3, 2)
+    if npy_grads is not None and npy_signal is not None:
+        plt.plot(npy_signal, label="ECG Signal")
+        plt.plot(npy_grads, label="Grad-CAM Weights", alpha=0.5)
+        plt.title("Grad-CAM (BiGRU)")
+        plt.legend()
+        plt.xlabel("Time Step")
+        plt.ylabel("Amplitude")
+    else:
+        plt.text(0.5, 0.5, "BiGRU Grad-CAM Failed", ha='center', va='center')
+        plt.title("Grad-CAM (BiGRU)")
+        plt.axis('off')
+
+    plt.subplot(1, 3, 3)
+    if png_attr is not None:
+        plt.imshow(np.abs(png_attr).mean(axis=0), cmap='hot')
+        plt.title("Attributions (MobileNetV4)")
+        plt.axis('off')
+    else:
+        plt.text(0.5, 0.5, "Attributions Failed", ha='center', va='center')
+        plt.title("Attributions (MobileNetV4)")
+        plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(f"{save_prefix}_visualization.png", dpi=200)
+    plt.show()
+
+# =========================
+# Modified Evaluation with XAI
+# =========================
+def evaluate_with_xai(model, loader, device, folder2label, num_samples=5):
+    model.eval()
+    all_preds, all_labels, all_probs = [], [], []
+    sample_count = 0
+
+    # Debug: Check class distribution in test loader
+    unique_labels = set()
+    for _, _, labels in loader:
+        unique_labels.update(labels.cpu().numpy())
+    print(f"Unique labels in test dataset: {sorted(unique_labels)}")
+    print(f"Expected number of classes (from folder2label): {len(folder2label)}")
+
+    for param in model.parameters():
+        param.requires_grad_(True)
+
+    for npy_batch, png_batch, labels in loader:
+        npy_batch = npy_batch.to(device)
+        png_batch = png_batch.to(device)
+        labels = labels.to(device)
+
+        with torch.no_grad():
+            outputs = model(npy_batch, png_batch)
+            probs = torch.softmax(outputs, dim=1)
+            preds = outputs.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+        print(f"Batch predictions: {preds.cpu().numpy()}, true labels: {labels.cpu().numpy()}")
+
+        if sample_count < num_samples:
+            for i in range(min(npy_batch.size(0), num_samples - sample_count)):
+                target_class = preds[i].item()
+                print(f"\nApplying XAI for sample {sample_count + 1}, predicted class: {target_class}")
+
+                gradcam, superimposed_img, npy_grads, npy_signal = get_gradcam(
+                    model, npy_batch[i:i+1], png_batch[i:i+1], target_class, device
+                )
+
+                npy_attr, png_attr = get_shap_explanations(
+                    model, npy_batch[i:i+1], png_batch[i:i+1], target_class, device
+                )
+
+                if gradcam is not None:
+                    original_image = png_batch[i].permute(1, 2, 0).detach().cpu().numpy()
+                    visualize_xai(
+                        gradcam, superimposed_img, npy_grads, npy_signal, png_attr, npy_attr,
+                        original_image, save_prefix=f"xai_sample_{sample_count + 1}"
+                    )
+                else:
+                    print(f"Skipping visualization for sample {sample_count + 1} due to Grad-CAM failure")
+
+                sample_count += 1
+            if sample_count >= num_samples:
+                break
+
+    # Classification metrics
+    target_names = [str(k) for k, _ in sorted(folder2label.items(), key=lambda x: x[1])]
+    unique_pred_classes = np.unique(all_preds)
+    unique_true_classes = np.unique(all_labels)
+    print(f"Unique predicted classes: {unique_pred_classes}")
+    print(f"Unique true classes: {unique_true_classes}")
+
+    try:
+        print("\n=== Classification Report ===")
+        print(classification_report(
+            all_labels,
+            all_preds,
+            labels=list(range(len(folder2label))),
+            target_names=target_names,
+            digits=4,
+            zero_division=0
+        ))
+    except ValueError as e:
+        print(f"Error in classification report: {e}")
+        print("Falling back to subset of classes present in predictions")
+        present_labels = sorted(unique_true_classes)
+        present_target_names = [target_names[i] for i in present_labels]
+        print(classification_report(
+            all_labels,
+            all_preds,
+            labels=present_labels,
+            target_names=present_target_names,
+            digits=4,
+            zero_division=0
+        ))
+
+    cm = confusion_matrix(all_labels, all_preds, labels=list(range(len(folder2label))))
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues')
+    plt.title("Confusion Matrix (counts)")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.tight_layout()
+    plt.savefig("confusion_matrix_with_xai.png", dpi=200)
+    plt.show()
+
+    return all_labels, all_preds, all_probs
+
+# =========================
+# Run Evaluation with XAI
+# =========================
+print("\nRunning evaluation with XAI...")
+evaluate_with_xai(model, test_loader, device, folder2label, num_samples=5)
+
+# Continue with original verification metrics (unchanged)
+embeddings, emb_labels = extract_all_embeddings(model, test_loader, device)
+pairs, pair_labels = make_pairs_from_embeddings(embeddings, emb_labels, num_genuine_per_class=200, num_impostor=2000, random_seed=62)
+verif_res = compute_verification_metrics(embeddings, emb_labels, pairs, pair_labels)
+
+print("\nEvaluation with XAI complete. Saved additional figures: xai_sample_*.png")
+
+
+import os
+import numpy as np
+from PIL import Image
+import torch
+from torchvision import transforms
+import matplotlib.pyplot as plt
+from captum.attr import IntegratedGradients, DeepLift
+import cv2
+import pkg_resources
+
+# Check Captum and PyTorch versions
+captum_version = pkg_resources.get_distribution("captum").version
+pytorch_version = torch.__version__
+print(f"Using Captum version: {captum_version}, PyTorch version: {pytorch_version}")
+
+# =========================
+# CONFIGURATION
+# =========================
+test_dir = r"C:\Users\sajan\Downloads\ECG_Research\ECG_ID_FINAL_GAN_SPLIT\test"
+
+# ✅ List of folders you want to run XAI on
+folders_to_analyze = [
+    "Person_05_1.23s_31.44dB",
+    "Person_09_2.58s_23.70dB",
+    "Person_14_2.16s_24.75dB",  # you can add as many as needed
+    "Person_25_1.46s_24.77dB"
+]
+
+# =========================
+# LOOP THROUGH EACH FOLDER
+# =========================
+for selected_folder in folders_to_analyze:
+    sample_path = os.path.join(test_dir, selected_folder)
+    if not os.path.exists(sample_path):
+        print(f"❌ Directory does not exist: {sample_path}")
+        continue
+
+    print(f"\n=== Running XAI for folder: {selected_folder} ===")
+
+    # Load .npy and .png files
+    npy_file, png_file = None, None
+    for file in os.listdir(sample_path):
+        if file.endswith(".npy"):
+            npy_file = os.path.join(sample_path, file)
+        elif file.endswith(".png"):
+            png_file = os.path.join(sample_path, file)
+
+    if npy_file is None or png_file is None:
+        print(f"⚠️ Missing .npy or .png file in {sample_path}")
+        continue
+
+    # Load and preprocess .npy file
+    npy_data = np.load(npy_file)
+    print(f"Raw .npy shape: {npy_data.shape}")
+
+    # Ensure npy_data is 1D or 2D with correct feature dimension
+    if len(npy_data.shape) == 1:
+        npy_data = npy_data[:, np.newaxis]
+    elif len(npy_data.shape) == 2 and npy_data.shape[1] != 1:
+        print(f"Warning: npy_data has shape {npy_data.shape}. Reducing to [seq_len, 1].")
+        npy_data = npy_data[:, 0:1]
+    elif len(npy_data.shape) > 2:
+        print(f"Error: Unexpected npy_data shape {npy_data.shape}. Expected 1D or 2D.")
+        continue
+
+    # Normalize and convert to tensor
+    npy_data = npy_data.astype(np.float32)
+    npy_data = (npy_data - npy_data.mean()) / (npy_data.std() + 1e-8)
+    npy_tensor = torch.from_numpy(npy_data).unsqueeze(0).to(device)  # [1, seq_len, 1]
+
+    # Load and preprocess .png file
+    image = Image.open(png_file).convert("RGB")
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    png_tensor = transform(image).unsqueeze(0).to(device)  # [1, 3, 224, 224]
+
+    # Model inference
+    try:
+        model.eval()
+        with torch.no_grad():
+            outputs = model(npy_tensor, png_tensor)
+            probs = torch.softmax(outputs, dim=1)
+            pred_class = outputs.argmax(dim=1).item()
+            print(f"Predicted class for sample: {pred_class}")
+    except RuntimeError as e:
+        print(f"❌ Model forward pass failed for {selected_folder}: {e}")
+        continue
+
+    # =========================
+    # APPLY XAI (Grad-CAM + SHAP)
+    # =========================
+    print(f"Applying XAI for {selected_folder}, predicted class: {pred_class}")
+
+    # Grad-CAM
+    gradcam, superimposed_img, npy_grads, npy_signal = get_gradcam(
+        model, npy_tensor, png_tensor, pred_class, device
+    )
+
+    # SHAP (Integrated Gradients)
+    npy_attr, png_attr = get_shap_explanations(
+        model, npy_tensor, png_tensor, pred_class, device
+    )
+
+    # Visualize and Save
+    if gradcam is not None:
+        original_image = png_tensor[0].permute(1, 2, 0).detach().cpu().numpy()
+        original_image = (original_image - original_image.min()) / (original_image.max() - original_image.min() + 1e-8)
+        visualize_xai(
+            gradcam, superimposed_img, npy_grads, npy_signal, png_attr, npy_attr,
+            original_image, save_prefix=f"xai_sample_{selected_folder}"
+        )
+        print(f"✅ Saved: xai_sample_{selected_folder}_visualization.png")
+    else:
+        print(f"⚠️ Skipping visualization for {selected_folder} due to Grad-CAM failure")
+
+print("\n🎯 XAI generation completed for all selected folders!")
+
+
+import time
+
+def measure_inference_speed(model, loader, device, num_batches=50):
+    model.eval()
+    timings = []
+    with torch.no_grad():
+        for i, (npy_batch, png_batch, _) in enumerate(loader):
+            if i >= num_batches:
+                break
+            npy_batch = npy_batch.to(device)
+            png_batch = png_batch.to(device)
+            start_time = time.time()
+            _ = model(npy_batch, png_batch)
+            if device.type == "cuda":
+                torch.cuda.synchronize()  # make sure GPU finished
+            end_time = time.time()
+            timings.append((end_time - start_time) * 1000)  # convert to ms
+
+    mean_time = np.mean(timings)
+    std_time = np.std(timings)
+    print(f"Inference speed on {device.type.upper()}: {mean_time:.2f} ± {std_time:.2f} ms per batch")
+    ms_per_sample = mean_time / CONFIG["batch_size"]
+    print(f"Approx. {ms_per_sample:.2f} ms per sample")
+
+    return mean_time, std_time
+
+# ------------------------
+# Measure GPU speed
+# ------------------------
+gpu_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_ = model.to(gpu_device)
+measure_inference_speed(model, test_loader, gpu_device, num_batches=50)
+
+# ------------------------
+# Measure CPU speed
+# ------------------------
+cpu_device = torch.device("cpu")
+_ = model.to(cpu_device)
+measure_inference_speed(model, test_loader, cpu_device, num_batches=50)
+
+
+# (env) PS C:\Users\sajan\Downloads\ECG_Research> python ECG_ID_MobileNetV4+GRU_PGD_GAN.py
+# USING DEVICE: cuda
+# PGD Attack: ENABLED
+#   - Epsilon: 0.02
+#   - Alpha: 0.005
+#   - Steps: 5
+# Total train files: 4602
+# Total validation files: 1078
+# Total test files: 982
+# Total all files: 6662
+# Unexpected keys (norm_head.num_batches_tracked, classifier.bias, classifier.weight, conv_head.weight, norm_head.bias, norm_head.running_mean, norm_head.running_var, norm_head.weight) found while loading pretrained weights. This may be expected if model is being adapted.
+# [MobileNetV4Branch] feature dimension (C): 960
+# Resuming training from epoch 155 with best Val Acc: 0.9610
+
+# ============================================================
+# Training Complete!
+# Best Validation Accuracy (within 5% gap): 0.9610
+# ============================================================
+
+# Running final evaluation...
+
+# === Classification Report ===
+#                          precision    recall  f1-score   support
+
+#              ECG_ID_GAN     1.0000    1.0000    1.0000        22
+# Person_01_1.71s_30.04dB     1.0000    0.9697    0.9846        33
+# Person_02_1.41s_23.38dB     1.0000    1.0000    1.0000        46
+# Person_03_3.28s_25.64dB     0.8000    1.0000    0.8889         4
+# Person_04_2.31s_26.40dB     0.5000    0.5000    0.5000         2
+# Person_05_1.23s_31.44dB     1.0000    1.0000    1.0000         5
+# Person_06_2.42s_33.13dB     0.6667    1.0000    0.8000         2
+# Person_07_2.01s_22.65dB     0.6667    0.6667    0.6667         3
+# Person_08_1.73s_18.75dB     1.0000    1.0000    1.0000         3
+# Person_09_2.58s_23.70dB     1.0000    1.0000    1.0000         7
+# Person_10_1.35s_24.26dB     1.0000    1.0000    1.0000        10
+# Person_11_2.67s_22.60dB     1.0000    1.0000    1.0000         3
+# Person_12_3.54s_16.46dB     1.0000    1.0000    1.0000         1
+# Person_13_1.98s_30.51dB     0.6000    1.0000    0.7500         3
+# Person_14_2.16s_24.75dB     1.0000    1.0000    1.0000         4
+# Person_15_2.77s_37.71dB     1.0000    1.0000    1.0000         2
+# Person_16_1.85s_31.05dB     1.0000    1.0000    1.0000         4
+# Person_17_2.10s_34.70dB     1.0000    1.0000    1.0000         3
+# Person_18_2.08s_23.51dB     0.7500    1.0000    0.8571         3
+# Person_19_2.97s_31.60dB     1.0000    1.0000    1.0000         2
+# Person_20_1.93s_25.10dB     1.0000    1.0000    1.0000         3
+# Person_21_2.00s_27.43dB     1.0000    1.0000    1.0000         4
+# Person_22_3.51s_15.67dB     1.0000    1.0000    1.0000         1
+# Person_23_2.49s_27.07dB     1.0000    1.0000    1.0000         2
+# Person_24_2.53s_25.71dB     0.8333    1.0000    0.9091         5
+# Person_25_1.46s_24.77dB     0.8889    0.8000    0.8421        10
+# Person_26_1.46s_27.13dB     0.8750    0.8750    0.8750         8
+# Person_27_2.49s_28.23dB     1.0000    1.0000    1.0000         4
+# Person_28_2.62s_29.24dB     1.0000    0.8000    0.8889         5
+# Person_29_1.95s_25.95dB     1.0000    1.0000    1.0000         3
+# Person_30_2.88s_28.50dB     1.0000    1.0000    1.0000         4
+# Person_31_2.19s_21.64dB     1.0000    1.0000    1.0000         3
+# Person_32_1.97s_21.24dB     1.0000    0.7778    0.8750         9
+# Person_33_2.32s_32.90dB     1.0000    1.0000    1.0000         2
+# Person_34_3.13s_22.01dB     1.0000    0.7500    0.8571         4
+# Person_35_1.00s_35.53dB     1.0000    1.0000    1.0000        15
+# Person_36_2.27s_18.90dB     1.0000    1.0000    1.0000         6
+# Person_37_1.47s_26.08dB     0.8000    1.0000    0.8889         4
+# Person_38_1.43s_23.71dB     1.0000    1.0000    1.0000         4
+# Person_39_1.33s_24.40dB     1.0000    1.0000    1.0000         4
+# Person_40_2.31s_24.59dB     1.0000    1.0000    1.0000         5
+# Person_41_2.31s_20.35dB     1.0000    1.0000    1.0000         2
+# Person_42_1.18s_16.68dB     1.0000    1.0000    1.0000        10
+# Person_43_2.56s_12.11dB     1.0000    1.0000    1.0000         2
+# Person_44_1.88s_21.67dB     1.0000    1.0000    1.0000         3
+# Person_45_2.23s_27.93dB     1.0000    1.0000    1.0000         2
+# Person_46_1.88s_16.34dB     0.7778    1.0000    0.8750         7
+# Person_47_1.53s_18.42dB     0.8000    1.0000    0.8889         4
+# Person_48_2.36s_21.40dB     1.0000    1.0000    1.0000         2
+# Person_49_1.69s_35.46dB     1.0000    1.0000    1.0000         3
+# Person_50_2.35s_19.00dB     1.0000    1.0000    1.0000         2
+# Person_51_1.83s_30.85dB     1.0000    1.0000    1.0000         6
+# Person_52_2.48s_18.28dB     1.0000    1.0000    1.0000        13
+# Person_53_1.67s_16.69dB     1.0000    0.8750    0.9333         8
+# Person_54_2.98s_21.72dB     1.0000    1.0000    1.0000         2
+# Person_55_2.30s_27.61dB     0.6667    1.0000    0.8000         2
+# Person_56_1.51s_26.18dB     1.0000    1.0000    1.0000         4
+# Person_57_2.21s_33.97dB     0.8000    1.0000    0.8889         4
+# Person_58_1.38s_29.18dB     1.0000    1.0000    1.0000         4
+# Person_59_2.00s_31.84dB     1.0000    1.0000    1.0000         7
+# Person_60_1.89s_31.06dB     1.0000    1.0000    1.0000         4
+# Person_61_1.83s_32.45dB     1.0000    1.0000    1.0000         6
+# Person_62_2.39s_21.46dB     1.0000    1.0000    1.0000         4
+# Person_63_1.21s_21.70dB     0.9333    1.0000    0.9655        14
+# Person_64_1.40s_35.71dB     1.0000    1.0000    1.0000         6
+# Person_65_1.74s_25.13dB     0.7500    1.0000    0.8571         3
+# Person_66_1.74s_22.67dB     1.0000    0.6667    0.8000         3
+# Person_67_2.20s_35.51dB     1.0000    0.7500    0.8571         4
+# Person_68_1.96s_21.71dB     1.0000    1.0000    1.0000         3
+# Person_69_2.12s_27.49dB     1.0000    0.6667    0.8000         3
+# Person_70_1.32s_25.23dB     1.0000    1.0000    1.0000         7
+# Person_71_1.80s_27.58dB     0.8889    1.0000    0.9412         8
+# Person_72_2.07s_31.41dB     1.0000    0.9091    0.9524        11
+# Person_73_2.04s_32.67dB     1.0000    1.0000    1.0000         3
+# Person_74_3.46s_22.40dB     1.0000    1.0000    1.0000         1
+# Person_75_1.78s_25.58dB     1.0000    1.0000    1.0000         5
+# Person_76_2.27s_33.61dB     1.0000    1.0000    1.0000         4
+# Person_77_2.46s_26.94dB     1.0000    1.0000    1.0000         4
+# Person_78_2.22s_15.81dB     1.0000    1.0000    1.0000         3
+# Person_79_1.62s_23.02dB     1.0000    1.0000    1.0000         4
+# Person_80_1.37s_29.94dB     1.0000    1.0000    1.0000         4
+# Person_81_2.41s_28.23dB     1.0000    0.5000    0.6667         2
+# Person_82_2.35s_19.04dB     1.0000    1.0000    1.0000         2
+# Person_83_1.84s_25.68dB     1.0000    0.3333    0.5000         3
+# Person_84_2.04s_26.72dB     1.0000    1.0000    1.0000         3
+# Person_85_2.26s_16.70dB     1.0000    1.0000    1.0000         4
+# Person_86_1.96s_25.33dB     1.0000    1.0000    1.0000         3
+# Person_87_1.82s_23.58dB     1.0000    1.0000    1.0000         3
+# Person_88_1.19s_19.56dB     1.0000    0.8571    0.9231         7
+# Person_89_1.38s_23.69dB     1.0000    1.0000    1.0000         4
+# Person_90_2.25s_26.95dB     1.0000    1.0000    1.0000         2
+
+#                accuracy                         0.9613       491
+#               macro avg     0.9560    0.9527    0.9476       491
+#            weighted avg     0.9683    0.9613    0.9606       491
+
+
+# Per-class ROC AUC (sample): [(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0), (4, 0.9989775051124745), (5, 1.0), (6, 0.9989775051124745), (7, 0.9931693989071038), (8, 1.0), (9, 1.0)]
+# Macro ROC-AUC (mean of per-class): 0.9990
+# Extracted embeddings shape: (491, 1536), labels shape: (491,)
+# Built 3616 pairs: 1616 genuine, 2000 impostor
+
+# Verification ROC AUC: 0.9918
+# EER: 0.0333 at threshold 0.8182 (FPR=0.0325, FNR=0.0340)
+# At EER-threshold -> FAR: 0.0325, FRR: 0.0340
+
+# Evaluation complete. Saved figures: training_history.png, confusion_matrix.png, verification_roc.png, verification_det.png, class_confidence_far_frr.png
+# Using captum version: 0.8.0, PyTorch version: 2.7.1+cu118
+
+# Running evaluation with XAI...
+# Unique labels in test dataset: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90]
+# Expected number of classes (from folder2label): 91
+# Batch predictions: [0 0 0 0], true labels: [0 0 0 0]
+
+# Applying XAI for sample 1, predicted class: 0
+# Using IntegratedGradients for attributions
+# Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.0..1.4].
+
+# Applying XAI for sample 2, predicted class: 0
+# Using IntegratedGradients for attributions
+# Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.0..1.3960785].
+
+# Applying XAI for sample 3, predicted class: 0
+# Using IntegratedGradients for attributions
+# Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.0..1.4].
+
+# Applying XAI for sample 4, predicted class: 0
+# Using IntegratedGradients for attributions
+# Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.0..1.3960785].
+# Batch predictions: [0 0 0 0], true labels: [0 0 0 0]
+
+# Applying XAI for sample 5, predicted class: 0
+# Using IntegratedGradients for attributions
+# Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.0..1.4].
+# Unique predicted classes: [0]
+# Unique true classes: [0]
+
+# === Classification Report ===
+#                          precision    recall  f1-score   support
+
+#              ECG_ID_GAN     1.0000    1.0000    1.0000         8
+# Person_01_1.71s_30.04dB     0.0000    0.0000    0.0000         0
+# Person_02_1.41s_23.38dB     0.0000    0.0000    0.0000         0
+# Person_03_3.28s_25.64dB     0.0000    0.0000    0.0000         0
+# Person_04_2.31s_26.40dB     0.0000    0.0000    0.0000         0
+# Person_05_1.23s_31.44dB     0.0000    0.0000    0.0000         0
+# Person_06_2.42s_33.13dB     0.0000    0.0000    0.0000         0
+# Person_07_2.01s_22.65dB     0.0000    0.0000    0.0000         0
+# Person_08_1.73s_18.75dB     0.0000    0.0000    0.0000         0
+# Person_09_2.58s_23.70dB     0.0000    0.0000    0.0000         0
+# Person_10_1.35s_24.26dB     0.0000    0.0000    0.0000         0
+# Person_11_2.67s_22.60dB     0.0000    0.0000    0.0000         0
+# Person_12_3.54s_16.46dB     0.0000    0.0000    0.0000         0
+# Person_13_1.98s_30.51dB     0.0000    0.0000    0.0000         0
+# Person_14_2.16s_24.75dB     0.0000    0.0000    0.0000         0
+# Person_15_2.77s_37.71dB     0.0000    0.0000    0.0000         0
+# Person_16_1.85s_31.05dB     0.0000    0.0000    0.0000         0
+# Person_17_2.10s_34.70dB     0.0000    0.0000    0.0000         0
+# Person_18_2.08s_23.51dB     0.0000    0.0000    0.0000         0
+# Person_19_2.97s_31.60dB     0.0000    0.0000    0.0000         0
+# Person_20_1.93s_25.10dB     0.0000    0.0000    0.0000         0
+# Person_21_2.00s_27.43dB     0.0000    0.0000    0.0000         0
+# Person_22_3.51s_15.67dB     0.0000    0.0000    0.0000         0
+# Person_23_2.49s_27.07dB     0.0000    0.0000    0.0000         0
+# Person_24_2.53s_25.71dB     0.0000    0.0000    0.0000         0
+# Person_25_1.46s_24.77dB     0.0000    0.0000    0.0000         0
+# Person_26_1.46s_27.13dB     0.0000    0.0000    0.0000         0
+# Person_27_2.49s_28.23dB     0.0000    0.0000    0.0000         0
+# Person_28_2.62s_29.24dB     0.0000    0.0000    0.0000         0
+# Person_29_1.95s_25.95dB     0.0000    0.0000    0.0000         0
+# Person_30_2.88s_28.50dB     0.0000    0.0000    0.0000         0
+# Person_31_2.19s_21.64dB     0.0000    0.0000    0.0000         0
+# Person_32_1.97s_21.24dB     0.0000    0.0000    0.0000         0
+# Person_33_2.32s_32.90dB     0.0000    0.0000    0.0000         0
+# Person_34_3.13s_22.01dB     0.0000    0.0000    0.0000         0
+# Person_35_1.00s_35.53dB     0.0000    0.0000    0.0000         0
+# Person_36_2.27s_18.90dB     0.0000    0.0000    0.0000         0
+# Person_37_1.47s_26.08dB     0.0000    0.0000    0.0000         0
+# Person_38_1.43s_23.71dB     0.0000    0.0000    0.0000         0
+# Person_39_1.33s_24.40dB     0.0000    0.0000    0.0000         0
+# Person_40_2.31s_24.59dB     0.0000    0.0000    0.0000         0
+# Person_41_2.31s_20.35dB     0.0000    0.0000    0.0000         0
+# Person_42_1.18s_16.68dB     0.0000    0.0000    0.0000         0
+# Person_43_2.56s_12.11dB     0.0000    0.0000    0.0000         0
+# Person_44_1.88s_21.67dB     0.0000    0.0000    0.0000         0
+# Person_45_2.23s_27.93dB     0.0000    0.0000    0.0000         0
+# Person_46_1.88s_16.34dB     0.0000    0.0000    0.0000         0
+# Person_47_1.53s_18.42dB     0.0000    0.0000    0.0000         0
+# Person_48_2.36s_21.40dB     0.0000    0.0000    0.0000         0
+# Person_49_1.69s_35.46dB     0.0000    0.0000    0.0000         0
+# Person_50_2.35s_19.00dB     0.0000    0.0000    0.0000         0
+# Person_51_1.83s_30.85dB     0.0000    0.0000    0.0000         0
+# Person_52_2.48s_18.28dB     0.0000    0.0000    0.0000         0
+# Person_53_1.67s_16.69dB     0.0000    0.0000    0.0000         0
+# Person_54_2.98s_21.72dB     0.0000    0.0000    0.0000         0
+# Person_55_2.30s_27.61dB     0.0000    0.0000    0.0000         0
+# Person_56_1.51s_26.18dB     0.0000    0.0000    0.0000         0
+# Person_57_2.21s_33.97dB     0.0000    0.0000    0.0000         0
+# Person_58_1.38s_29.18dB     0.0000    0.0000    0.0000         0
+# Person_59_2.00s_31.84dB     0.0000    0.0000    0.0000         0
+# Person_60_1.89s_31.06dB     0.0000    0.0000    0.0000         0
+# Person_61_1.83s_32.45dB     0.0000    0.0000    0.0000         0
+# Person_62_2.39s_21.46dB     0.0000    0.0000    0.0000         0
+# Person_63_1.21s_21.70dB     0.0000    0.0000    0.0000         0
+# Person_64_1.40s_35.71dB     0.0000    0.0000    0.0000         0
+# Person_65_1.74s_25.13dB     0.0000    0.0000    0.0000         0
+# Person_66_1.74s_22.67dB     0.0000    0.0000    0.0000         0
+# Person_67_2.20s_35.51dB     0.0000    0.0000    0.0000         0
+# Person_68_1.96s_21.71dB     0.0000    0.0000    0.0000         0
+# Person_69_2.12s_27.49dB     0.0000    0.0000    0.0000         0
+# Person_70_1.32s_25.23dB     0.0000    0.0000    0.0000         0
+# Person_71_1.80s_27.58dB     0.0000    0.0000    0.0000         0
+# Person_72_2.07s_31.41dB     0.0000    0.0000    0.0000         0
+# Person_73_2.04s_32.67dB     0.0000    0.0000    0.0000         0
+# Person_74_3.46s_22.40dB     0.0000    0.0000    0.0000         0
+# Person_75_1.78s_25.58dB     0.0000    0.0000    0.0000         0
+# Person_76_2.27s_33.61dB     0.0000    0.0000    0.0000         0
+# Person_77_2.46s_26.94dB     0.0000    0.0000    0.0000         0
+# Person_78_2.22s_15.81dB     0.0000    0.0000    0.0000         0
+# Person_79_1.62s_23.02dB     0.0000    0.0000    0.0000         0
+# Person_80_1.37s_29.94dB     0.0000    0.0000    0.0000         0
+# Person_81_2.41s_28.23dB     0.0000    0.0000    0.0000         0
+# Person_82_2.35s_19.04dB     0.0000    0.0000    0.0000         0
+# Person_83_1.84s_25.68dB     0.0000    0.0000    0.0000         0
+# Person_84_2.04s_26.72dB     0.0000    0.0000    0.0000         0
+# Person_85_2.26s_16.70dB     0.0000    0.0000    0.0000         0
+# Person_86_1.96s_25.33dB     0.0000    0.0000    0.0000         0
+# Person_87_1.82s_23.58dB     0.0000    0.0000    0.0000         0
+# Person_88_1.19s_19.56dB     0.0000    0.0000    0.0000         0
+# Person_89_1.38s_23.69dB     0.0000    0.0000    0.0000         0
+# Person_90_2.25s_26.95dB     0.0000    0.0000    0.0000         0
+
+#                accuracy                         1.0000         8
+#               macro avg     0.0110    0.0110    0.0110         8
+#            weighted avg     1.0000    1.0000    1.0000         8
+
+
+# Verification ROC AUC: 0.9790
+# EER: 0.0708 at threshold 0.7969 (FPR=0.0710, FNR=0.0705)
+# At EER-threshold -> FAR: 0.0710, FRR: 0.0705
+
+# Evaluation with XAI complete. Saved additional figures: xai_sample_*.png
+# Using captum version: 0.8.0, PyTorch version: 2.7.1+cu118
+# Raw .npy shape: (128, 1080)
+# Warning: npy_data has shape (128, 1080). Reducing to [seq_len, 1].
+# npy_tensor shape: torch.Size([1, 128, 1])
+# png_tensor shape: torch.Size([1, 3, 224, 224])
+# Predicted class for sample: 14
+
+# Applying XAI for sample, predicted class: 14
+# Using IntegratedGradients for attributions
+# Clipping input data to the valid range for imshow with RGB data ([0..1] for floats or [0..255] for integers). Got range [0.0..1.4].
+
+# XAI visualization saved as xai_sample_Person_14_2.16s_24.75dB_visualization.png
+# (env) PS C:\Users\sajan\Downloads\ECG_Research> 
+
+
+
+import os
+from tabulate import tabulate
+import shutil
+
+# Path to your main ECG-ID directory
+base_dir = r"C:\Users\sajan\Downloads\ECG_Research\ecg-id-database-1.0.0\ecg-id-database-1.0.0"
+
+# Prepare a list to hold details
+data = []
+
+# Walk through each subfolder
+for folder in sorted(os.listdir(base_dir)):
+    folder_path = os.path.join(base_dir, folder)
+    if os.path.isdir(folder_path):
+        # List all files inside the folder
+        files = os.listdir(folder_path)
+        
+        atr_files = [f for f in files if f.endswith('.atr')]
+        dat_files = [f for f in files if f.endswith('.dat')]
+        hea_files = [f for f in files if f.endswith('.hea')]
+        
+        # Number of recordings (based on common base filenames)
+        recordings = len(set([os.path.splitext(f)[0] for f in atr_files]))
+        
+        data.append([
+            folder,
+            len(atr_files),
+            len(dat_files),
+            len(hea_files),
+            recordings
+        ])
+
+# Print as a formatted table
+headers = ["Folder Name", ".atr", ".dat", ".hea", "Recordings"]
+print(tabulate(data, headers=headers, tablefmt="fancy_grid"))
+
+import wfdb
+import os
+import matplotlib.pyplot as plt
+
+# Path to one person's folder (change to any person_xx)
+person_folder = r"C:\Users\sajan\Downloads\ECG_Research\ecg-id-database-1.0.0\ecg-id-database-1.0.0\person_01"
+
+# List all .hea files (each one represents a recording)
+hea_files = [f for f in os.listdir(person_folder) if f.endswith('.hea')]
+
+if not hea_files:
+    print("No .hea files found in this folder!")
+else:
+    # Choose the first recording for example
+    first_record = os.path.splitext(hea_files[0])[0]
+    record_path = os.path.join(person_folder, first_record)
+
+    # Read ECG signal
+    record = wfdb.rdrecord(record_path)
+
+    # Try reading annotations (.atr), if available
+    try:
+        annotation = wfdb.rdann(record_path, 'atr')
+        print("Annotations found!")
+    except:
+        annotation = None
+        print("No annotations found.")
+
+    # Plot
+    # wfdb.plot_wfdb(record=record, annotation=annotation,
+    #                title=f"ECG from {first_record}",
+    #                time_units='seconds')
+
+    # plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ==========================================================
+# 1️⃣ Reproducibility
+# ==========================================================
+SEED = 38
+np.random.seed(SEED)
+
+# ==========================================================
+# 2️⃣ Generate Normally Distributed Values
+# ==========================================================
+n = 90
+
+# Noise (SNR in dB)
+mean_db = 25
+std_db = 5
+db_values = np.random.normal(mean_db, std_db, n)
+db_values = np.clip(db_values, 10, 40)
+
+# Duration (seconds)
+mean_sec = 2.0
+std_sec = 0.5
+duration_values = np.random.normal(mean_sec, std_sec, n)
+duration_values = np.clip(duration_values, 1.0, 4.0)
+
+# ==========================================================
+# 3️⃣ Plot the Distributions
+# ==========================================================
+plt.figure(figsize=(15, 5))
+
+# ---- Duration Distribution ----
+plt.subplot(1, 3, 1)
+sns.histplot(duration_values, kde=True, bins=12, color="seagreen")
+plt.title("Normal Distribution of Segment Duration (1–4 s)")
+plt.xlabel("Duration (s)")
+plt.ylabel("Frequency")
+
+# ---- Noise (dB) Distribution ----
+plt.subplot(1, 3, 2)
+sns.histplot(db_values, kde=True, bins=12, color="royalblue")
+plt.title("Normal Distribution of SNR (10–40 dB)")
+plt.xlabel("SNR (dB)")
+plt.ylabel("Frequency")
+
+# ---- Scatter Plot: Duration vs dB ----
+plt.subplot(1, 3, 3)
+sns.scatterplot(x=duration_values, y=db_values, color="darkorange", s=60)
+plt.title("Duration vs Noise Level (Scatter Plot)")
+plt.xlabel("Duration (s)")
+plt.ylabel("SNR (dB)")
+plt.grid(True, linestyle='--', alpha=0.6)
+
+plt.tight_layout()
+plt.show()
+
+# ==========================================================
+# 3️⃣ New directory where renamed folders will be created
+# ==========================================================
+new_base_dir = os.path.join(os.path.dirname(base_dir), "ecg-id-database-1.0.0_mapped")
+os.makedirs(new_base_dir, exist_ok=True)
+
+# ==========================================================
+# 5️⃣ Sort folders and filter only Person_01 to Person_90
+# ==========================================================
+all_folders = [f for f in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, f))]
+
+# Keep only folders matching Person_01 ... Person_90
+folders = sorted([f for f in all_folders if f.startswith("Person_")])
+
+# Ensure exactly 90 folders
+if len(folders) != 90:
+    print(f"⚠️ Expected 90 folders (Person_01 to Person_90), found {len(folders)} instead!")
+else:
+    for i, folder in enumerate(folders):
+        duration = round(float(duration_values[i]), 2)
+        db = round(float(db_values[i]), 2)
+        
+        new_folder_name = f"{folder}_{duration:.2f}s_{db:.2f}dB"
+        src = os.path.join(base_dir, folder)
+        dst = os.path.join(new_base_dir, new_folder_name)
+
+        # Copy the folder and its contents
+        shutil.copytree(src, dst)
+
+    print(f"✅ All 90 folders (Person_01 to Person_90) mapped and copied to:\n{new_base_dir}")
+
+# Optional preview of first 5 mappings
+for i in range(5):
+    print(f"{folders[i]} → {folders[i]}_{duration_values[i]:.2f}s_{db_values[i]:.2f}dB")
+
+import os
+import wfdb
+import numpy as np
+
+# Base directory containing mapped folders
+base_dir = r"C:\Users\sajan\Downloads\ECG_Research\ecg-id-database-1.0.0\ecg-id-database-1.0.0_mapped"
+
+# Loop over all folders
+for folder in sorted(os.listdir(base_dir)):
+    folder_path = os.path.join(base_dir, folder)
+    if not os.path.isdir(folder_path):
+        continue
+
+    # Find all .hea files (each corresponds to a recording)
+    hea_files = [f for f in os.listdir(folder_path) if f.endswith('.hea')]
+    
+    for hea_file in hea_files:
+        record_name = os.path.splitext(hea_file)[0]
+        record_path = os.path.join(folder_path, record_name)
+
+        # Read ECG signal using wfdb
+        record = wfdb.rdrecord(record_path)
+        # Get signal as numpy array
+        signal = record.p_signal  # shape: (samples, channels)
+
+        # Save as .npy
+        npy_path = os.path.join(folder_path, f"{record_name}.npy")
+        np.save(npy_path, signal)
+
+        print(f"✅ Saved {npy_path}")
+import os
+import wfdb
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+
+# ===== Base mapped directory =====
+base_dir = r"C:\Users\sajan\Downloads\ECG_Research\ecg-id-database-1.0.0\ecg-id-database-1.0.0_mapped"
+
+# ===== List all folders and randomly select one =====
+all_folders = [f for f in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, f))]
+folder_to_plot = random.choice(all_folders)
+folder_path = os.path.join(base_dir, folder_to_plot)
+
+print(f"Randomly selected folder: {folder_to_plot}")
+
+# ===== Convert .dat to .npy if not exists =====
+hea_files = [f for f in os.listdir(folder_path) if f.endswith('.hea')]
+
+for hea_file in hea_files:
+    record_name = os.path.splitext(hea_file)[0]
+    npy_path = os.path.join(folder_path, f"{record_name}.npy")
+    
+    if not os.path.exists(npy_path):
+        print(f"Converting {record_name} to .npy")
+        record_path = os.path.join(folder_path, record_name)
+        record = wfdb.rdrecord(record_path)
+        signal = record.p_signal  # (samples, channels)
+        np.save(npy_path, signal)
+    else:
+        print(f".npy already exists for {record_name}, skipping.")
+
+# ===== Load and plot the first .npy =====
+if len(hea_files) > 0:
+    first_record = os.path.splitext(hea_files[0])[0]
+    npy_file = os.path.join(folder_path, f"{first_record}.npy")
+    
+    signal = np.load(npy_file)
+    fs = wfdb.rdrecord(os.path.join(folder_path, first_record)).fs  # sampling frequency
+    time = np.arange(signal.shape[0]) / fs
+    
+    plt.figure(figsize=(12,4))
+    plt.plot(time, signal[:,0], color='blue')  # first lead
+    plt.title(f"ECG Signal from {first_record} in {folder_to_plot}")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Amplitude [mV]")
+    plt.grid(True)
+    plt.show()
+import os
+import re
+import numpy as np
+import wfdb
+
+# ===== Base mapped directory =====
+base_dir = r"C:\Users\sajan\Downloads\ECG_Research\ecg-id-database-1.0.0\ecg-id-database-1.0.0_mapped"
+
+# ===== Iterate over all folders =====
+for folder in sorted(os.listdir(base_dir)):
+    folder_path = os.path.join(base_dir, folder)
+    if not os.path.isdir(folder_path):
+        continue
+
+    # ----- Extract duration and noise from folder name -----
+    # Example: Person_01_2.15s_30.04dB
+    match = re.search(r'_(\d+\.\d+)s_(\d+\.\d+)dB', folder)
+    if match:
+        duration_sec = float(match.group(1))
+        noise_db = float(match.group(2))
+    else:
+        print(f"⚠️ Could not parse duration/noise from folder: {folder}")
+        continue
+
+    # ----- Process all .npy files in folder -----
+    npy_files = [f for f in os.listdir(folder_path) if f.endswith('.npy')]
+    if not npy_files:
+        continue
+
+    # ----- Check if segmented files already exist -----
+    segment_pattern = re.compile(r'-segment-\d+-\d+\.\d+s-\d+\.\d+dB\.npy')
+    existing_segments = [f for f in os.listdir(folder_path) if segment_pattern.search(f)]
+    if existing_segments:
+        print(f"⚠️ Segments already exist in folder {folder}, skipping...")
+        continue
+
+    # ----- Split each .npy into non-overlapping segments -----
+    for npy_file in npy_files:
+        npy_path = os.path.join(folder_path, npy_file)
+
+        # Load signal
+        signal = np.load(npy_path)
+        if signal.ndim == 1:
+            signal = signal[:, np.newaxis]  # ensure 2D: (samples, channels)
+
+        # Get sampling frequency from corresponding .hea file
+        record_name = os.path.splitext(npy_file)[0]
+        try:
+            fs = wfdb.rdrecord(os.path.join(folder_path, record_name)).fs
+        except:
+            print(f"⚠️ Could not read fs from {record_name}.hea, skipping.")
+            continue
+
+        # Compute number of samples per segment
+        segment_samples = int(duration_sec * fs)
+        n_segments = signal.shape[0] // segment_samples
+
+        # Save non-overlapping segments
+        for i in range(n_segments):
+            start = i * segment_samples
+            end = start + segment_samples
+            segment = signal[start:end]
+
+            segment_filename = f"{record_name}-segment-{i+1}-{duration_sec:.2f}s-{noise_db:.2f}dB.npy"
+            segment_path = os.path.join(folder_path, segment_filename)
+            np.save(segment_path, segment)
+
+        print(f"✅ {n_segments} segments created for {npy_file} in {folder}")
+import os
+import re
+import numpy as np
+import pywt
+from scipy.signal import butter, filtfilt
+import matplotlib.pyplot as plt
+
+# ===== Base mapped directory =====
+base_dir = r"C:\Users\sajan\Downloads\ECG_Research\ecg-id-database-1.0.0\ecg-id-database-1.0.0_mapped"
+
+# ===== Bandpass Filter =====
+def bandpass_filter(signal, fs, lowcut=0.5, highcut=40, order=4):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, signal, axis=0)
+
+# ===== Add Gaussian Noise based on SNR dB =====
+def add_noise(signal, snr_db):
+    P_signal = np.mean(signal ** 2)
+    P_noise = P_signal / (10**(snr_db / 10))
+    noise = np.random.normal(0, np.sqrt(P_noise), signal.shape)
+    return signal + noise
+
+# ===== Normalize signal to [-1,1] =====
+def normalize(signal):
+    return signal / np.max(np.abs(signal))
+
+# ===== Iterate over folders =====
+for folder in sorted(os.listdir(base_dir)):
+    folder_path = os.path.join(base_dir, folder)
+    if not os.path.isdir(folder_path):
+        continue
+
+    # Extract duration and noise_db from folder name
+    match = re.search(r'_(\d+\.\d+)s_(\d+\.\d+)dB', folder)
+    if match:
+        duration_sec = float(match.group(1))
+        noise_db = float(match.group(2))
+    else:
+        print(f"⚠️ Could not parse duration/noise from folder: {folder}")
+        continue
+
+    # Process all segmented .npy files
+    segment_files = [f for f in os.listdir(folder_path) if f.endswith('.npy') and 'segment' in f and '_NOISY' not in f]
+    for seg_file in segment_files:
+        seg_path = os.path.join(folder_path, seg_file)
+        noisy_filename = seg_file.replace(".npy", "_NOISY.npy")
+        noisy_path = os.path.join(folder_path, noisy_filename)
+        png_filename = noisy_filename.replace(".npy", ".png")
+        png_path = os.path.join(folder_path, png_filename)
+
+        # 1️⃣ Skip if both _NOISY.npy and .png exist
+        if os.path.exists(noisy_path) and os.path.exists(png_path):
+            print(f"⚠️ {noisy_filename} and {png_filename} already exist. Skipping...")
+            continue
+
+        # Load segment
+        segment = np.load(seg_path)
+        if segment.ndim == 1:
+            segment = segment[:, np.newaxis]
+
+        # Sampling frequency
+        record_name = re.match(r'^(rec_\d+)', seg_file).group(1)
+        try:
+            import wfdb
+            fs = wfdb.rdrecord(os.path.join(folder_path, record_name)).fs
+        except:
+            fs = 500
+            print(f"⚠️ Could not read fs, using default 250 Hz for {seg_file}")
+
+        # 1️⃣ Bandpass filter
+        segment_filtered = bandpass_filter(segment, fs)
+
+        # 2️⃣ Add Gaussian noise
+        segment_noisy = add_noise(segment_filtered, noise_db)
+
+        # 3️⃣ Normalize
+        segment_noisy = normalize(segment_noisy)
+
+        # 4️⃣ Generate CWT
+        widths = np.arange(1, 129)
+        cwt_matrix, _ = pywt.cwt(segment_noisy[:,0], widths, 'morl')
+
+        # 5️⃣ Save .npy
+        np.save(noisy_path, cwt_matrix)
+
+        # 6️⃣ Save as .png
+        plt.figure(figsize=(4,4))
+        plt.imshow(np.abs(cwt_matrix), aspect='auto', cmap='jet', origin='upper')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(png_path, bbox_inches='tight', pad_inches=0)
+        plt.close()
+
+        print(f"✅ Processed {seg_file} → {noisy_filename} & {png_filename} (CWT shape: {cwt_matrix.shape})")
+
