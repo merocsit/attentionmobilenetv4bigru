@@ -1123,8 +1123,11 @@ pairs, pair_labels = make_pairs_from_embeddings(embeddings, emb_labels, num_genu
 verif_res = compute_verification_metrics(embeddings, emb_labels, pairs, pair_labels)
 
 print("\nEvaluation with XAI complete. Saved additional figures: xai_sample_*.png")
+===============================================================================================================================================
+## Brief Ablation Studies on Attention mechanism only
+## https://www.kaggle.com/code/dillihangrai/mobilenetv4-bigru-attention-visualization
 
-
+===============================================================================================================================================
 import os
 import numpy as np
 from PIL import Image
@@ -1567,7 +1570,7 @@ measure_inference_speed(model, test_loader, cpu_device, num_batches=50)
 # XAI visualization saved as xai_sample_Person_14_2.16s_24.75dB_visualization.png
 # (env) PS C:\Users\sajan\Downloads\ECG_Research> 
 
-
+===============================================================================================================================================
 
 import os
 from tabulate import tabulate
@@ -1733,6 +1736,8 @@ else:
 for i in range(5):
     print(f"{folders[i]} → {folders[i]}_{duration_values[i]:.2f}s_{db_values[i]:.2f}dB")
 
+===============================================================================================================================================
+
 import os
 import wfdb
 import numpy as np
@@ -1811,6 +1816,8 @@ if len(hea_files) > 0:
     plt.ylabel("Amplitude [mV]")
     plt.grid(True)
     plt.show()
+
+===============================================================================================================================================
 import os
 import re
 import numpy as np
@@ -1879,6 +1886,9 @@ for folder in sorted(os.listdir(base_dir)):
             np.save(segment_path, segment)
 
         print(f"✅ {n_segments} segments created for {npy_file} in {folder}")
+
+===============================================================================================================================================
+
 import os
 import re
 import numpy as np
@@ -1977,7 +1987,7 @@ for folder in sorted(os.listdir(base_dir)):
 
         print(f"✅ Processed {seg_file} → {noisy_filename} & {png_filename} (CWT shape: {cwt_matrix.shape})")
 
-
+===============================================================================================================================================
 
 # ==============================
 # 1️⃣ Imports
@@ -2175,7 +2185,7 @@ torch.save(netD.state_dict(), f"{output_dir}/discriminator.pth")
 print("🎉 Training finished and models saved!")
 
 
-
+===============================================================================================================================================
 
 # ==============================
 # 1️⃣ Imports
